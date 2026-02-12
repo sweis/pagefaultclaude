@@ -1,0 +1,14 @@
+build/
+*.o
+*.iso
+
+# Reference code from kristerw/instless_comp (not part of this project)
+setup.c
+setup.h
+screen.c
+screen.h
+loader.S
+Makefile.instless
+movdbz-addition.s
+/linker.ld
+/set_gdtr.S
