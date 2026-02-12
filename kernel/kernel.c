@@ -143,197 +143,238 @@ static void serial_puts(const char *s) {
     while (*s) serial_write(*s++);
 }
 
-/* ========== Keyboard (PS/2) ========== */
+/* (Keyboard driver removed - I/O is via serial) */
 
-#define KBD_DATA   0x60
-#define KBD_STATUS 0x64
-
-/* Scancode set 1 -> ASCII (US QWERTY, lowercase only, simplified) */
-static const char scancode_to_ascii[128] = {
-    0, 27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',
-    '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
-    0, 'a','s','d','f','g','h','j','k','l',';','\'','`',
-    0, '\\','z','x','c','v','b','n','m',',','.','/',0,
-    '*',0,' ',0, 0,0,0,0,0,0,0,0,0,0, 0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-};
-
-static char kbd_getchar(void) {
-    while (1) {
-        if (inb(KBD_STATUS) & 0x01) {
-            uint8_t scancode = inb(KBD_DATA);
-            if (scancode & 0x80) continue;  /* Ignore key release */
-            char c = scancode_to_ascii[scancode];
-            if (c) return c;
-        }
-    }
-}
-
-/* ========== REPL ========== */
+/* ========== I/O Bridge Buffer ========== */
 
 #define PROMPT_BUF_SIZE 1024
 
 static char prompt_buf[PROMPT_BUF_SIZE];
 static size_t prompt_len;
 
+/* Simple string comparison (up to n chars) */
+static int streq(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+/* (vga_putnum/serial_putnum removed - not needed for REPL) */
+
 /*
- * Read a line of user input from keyboard.
- * Echoes characters to VGA. Returns on Enter.
+ * ========== Weird Machine REPL Program ==========
+ *
+ * The REPL state machine runs inside the page fault weird machine.
+ * It uses I/O bridge "exits" to communicate with the outside world.
+ *
+ * Register allocation:
+ *   r0 = cmd    (I/O command: 0=exit, 1=read_byte, 2=write_byte, 3=send_query, 4=recv_response)
+ *   r1 = data   (byte value for read/write)
+ *   r2 = state  (internal state for quit detection)
+ *   r3 = temp
+ *
+ * The movdbz REPL program:
+ *
+ *   -- PHASE 1: Signal "read a line" to bridge --
+ *   L0:  movdbz r0, CMD_READ_BYTE, L1, L1   ; r0 = READ_BYTE (1)
+ *   L1:  movdbz _, _, EXIT, EXIT             ; exit to bridge (read byte)
+ *
+ *   -- PHASE 1b: Bridge resumes here after reading a byte into r1.
+ *        Bridge checks: if byte=='\n', resume at L2 (send query).
+ *        If byte!='\n', resume at L0 (read more). --
+ *
+ *   -- PHASE 2: Signal "send query" to bridge --
+ *   L2:  movdbz r0, CMD_SEND_Q, L3, L3      ; r0 = SEND_QUERY (3)
+ *   L3:  movdbz _, _, EXIT, EXIT             ; exit to bridge
+ *
+ *   -- PHASE 2b: Bridge resumes here after sending query --
+ *
+ *   -- PHASE 3: Signal "receive response" to bridge --
+ *   L4:  movdbz r0, CMD_RECV_R, L5, L5      ; r0 = RECV_RESPONSE (4)
+ *   L5:  movdbz _, _, EXIT, EXIT             ; exit to bridge
+ *
+ *   -- PHASE 3b: Bridge resumes here after response is fully received --
+ *   -- Loop back to PHASE 1 (read next line) --
+ *   L6:  movdbz r0, 1, L0, L0               ; jmp L0 (loop)
+ *
+ * The bridge handles:
+ *   - READ_BYTE: read char from serial, store in r1, check for newline/quit
+ *   - SEND_QUERY: send accumulated prompt_buf over serial as "Q:...\n"
+ *   - RECV_RESPONSE: read serial until EOT, relay each byte back over serial
+ *   - EXIT: halt
+ *
+ * Constants needed: CMD values (1, 3, 4), plus 1 for the loop-back.
  */
-static void read_prompt(void) {
+
+/* Instruction labels for the movdbz REPL program */
+enum {
+    L_READ_CMD   = 0,   /* Set r0 = READ_BYTE */
+    L_READ_EXIT  = 1,   /* Exit to bridge */
+    L_SEND_CMD   = 2,   /* Set r0 = SEND_QUERY */
+    L_SEND_EXIT  = 3,   /* Exit to bridge */
+    L_RECV_CMD   = 4,   /* Set r0 = RECV_RESPONSE */
+    L_RECV_EXIT  = 5,   /* Exit to bridge */
+    L_LOOP       = 6,   /* Loop back to L0 */
+    NUM_REPL_INSTS = 7,
+};
+
+/* REPL register indices */
+enum {
+    R_CMD  = 0,
+    R_DATA = 1,
+    R_TEMP = 2,
+};
+
+static void build_repl_program(void) {
+    /* Allocate user registers */
+    wm_write_reg(R_CMD, 0);
+    wm_write_reg(R_DATA, 0);
+    wm_write_reg(R_TEMP, 0);
+
+    /* Allocate constants */
+    int c_read  = wm_alloc_const(WM_IO_READ_BYTE);    /* 1 */
+    int c_sendq = wm_alloc_const(WM_IO_SEND_QUERY);   /* 3 */
+    int c_recvr = wm_alloc_const(WM_IO_RECV_RESPONSE); /* 4 */
+    int c_one   = wm_alloc_const(1);                    /* for loop-back */
+
+    /* L0: movdbz r0, c_read, L1, L1   -- r0 = READ_BYTE */
+    wm_gen_movdbz(L_READ_CMD,  R_CMD, c_read, L_READ_EXIT, L_READ_EXIT);
+
+    /* L1: movdbz discard, discard, EXIT, EXIT  -- exit to bridge */
+    wm_gen_movdbz(L_READ_EXIT, WM_REG_DISCARD, WM_REG_DISCARD, -1, -1);
+
+    /* L2: movdbz r0, c_sendq, L3, L3  -- r0 = SEND_QUERY */
+    wm_gen_movdbz(L_SEND_CMD,  R_CMD, c_sendq, L_SEND_EXIT, L_SEND_EXIT);
+
+    /* L3: movdbz discard, discard, EXIT, EXIT  -- exit to bridge */
+    wm_gen_movdbz(L_SEND_EXIT, WM_REG_DISCARD, WM_REG_DISCARD, -1, -1);
+
+    /* L4: movdbz r0, c_recvr, L5, L5  -- r0 = RECV_RESPONSE */
+    wm_gen_movdbz(L_RECV_CMD,  R_CMD, c_recvr, L_RECV_EXIT, L_RECV_EXIT);
+
+    /* L5: movdbz discard, discard, EXIT, EXIT  -- exit to bridge */
+    wm_gen_movdbz(L_RECV_EXIT, WM_REG_DISCARD, WM_REG_DISCARD, -1, -1);
+
+    /* L6: movdbz r_temp, c_one, L0, L0  -- unconditional jump to L0 */
+    wm_gen_movdbz(L_LOOP, R_TEMP, c_one, L_READ_CMD, L_READ_CMD);
+
+    /* Pre-generate all instruction pages */
+    wm_generate();
+}
+
+/*
+ * I/O Bridge: services weird machine I/O requests over serial.
+ *
+ * The weird machine runs a state machine via page faults.
+ * Each time it needs I/O, it sets r_cmd to a command code and exits.
+ * The bridge reads r_cmd, performs the I/O, and resumes the weird machine
+ * at the appropriate instruction.
+ */
+static void io_bridge_loop(void) {
     prompt_len = 0;
 
-    while (prompt_len < PROMPT_BUF_SIZE - 1) {
-        char c = kbd_getchar();
+    serial_puts("READY\n");
 
-        if (c == '\n') {
+    /* First launch: start at L0 (read command) */
+    vga_set_color(VGA_DARK_GREY, VGA_BLACK);
+    vga_puts("[weird machine: launching fault cascade]\n");
+
+    wm_launch();
+
+    /* The weird machine has exited. Service I/O requests in a loop. */
+    while (1) {
+        uint32_t cmd = wm_read_reg(R_CMD);
+
+        switch (cmd) {
+        case WM_IO_READ_BYTE: {
+            /* Read one byte from serial */
+            char c = serial_read();
+
+            if (c == '\n' || c == '\r') {
+                /* End of line - resume at L_SEND_CMD (send query) */
+                serial_write('\n');  /* Echo newline */
+
+                /* Check for "quit" */
+                if (prompt_len == 4 && streq(prompt_buf, "quit", 4)) {
+                    vga_set_color(VGA_YELLOW, VGA_BLACK);
+                    vga_puts("[quit]\n");
+                    serial_puts("BYE\n");
+                    return;
+                }
+
+                /* Resume weird machine at send-query phase */
+                wm_write_reg(R_CMD, 0);
+                wm_resume(L_SEND_CMD);
+            } else {
+                /* Accumulate byte in buffer, echo it */
+                if (prompt_len < PROMPT_BUF_SIZE - 1) {
+                    prompt_buf[prompt_len++] = c;
+                }
+                serial_write(c);  /* Echo */
+
+                /* Resume weird machine at read-cmd (read next byte) */
+                wm_write_reg(R_CMD, 0);
+                wm_resume(L_READ_CMD);
+            }
+            break;
+        }
+
+        case WM_IO_SEND_QUERY: {
+            /* Send the accumulated buffer as a query */
             prompt_buf[prompt_len] = '\0';
+
+            vga_set_color(VGA_DARK_GREY, VGA_BLACK);
+            vga_puts("[query: ");
+            vga_puts(prompt_buf);
+            vga_puts("]\n");
+
+            /* Wire protocol: Q:<text>\n */
+            serial_puts("Q:");
+            for (size_t i = 0; i < prompt_len; i++)
+                serial_write(prompt_buf[i]);
+            serial_write('\n');
+
+            /* Reset buffer for next prompt */
+            prompt_len = 0;
+
+            /* Resume weird machine at recv-response phase */
+            wm_write_reg(R_CMD, 0);
+            wm_resume(L_RECV_CMD);
+            break;
+        }
+
+        case WM_IO_RECV_RESPONSE: {
+            /* Read response from proxy: "A:<text>\x04" */
+            /* Skip "A:" prefix */
+            char c1 = serial_read();
+            char c2 = serial_read();
+            (void)c1; (void)c2;
+
+            /* Relay response bytes to serial output (and VGA) until EOT */
+            vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
+            while (1) {
+                char c = serial_read();
+                if (c == 0x04) break;
+                serial_write(c);  /* Relay to user's terminal */
+                vga_putchar(c);
+            }
+            serial_write('\n');
             vga_putchar('\n');
+
+            /* Resume weird machine at loop-back instruction */
+            wm_write_reg(R_CMD, 0);
+            wm_resume(L_LOOP);
+            break;
+        }
+
+        case WM_IO_EXIT:
+        default:
+            /* Program done or unknown command */
+            vga_set_color(VGA_YELLOW, VGA_BLACK);
+            vga_puts("[weird machine exited]\n");
             return;
         }
-        if (c == '\b') {
-            if (prompt_len > 0) {
-                prompt_len--;
-                vga_putchar('\b');
-            }
-            continue;
-        }
-
-        prompt_buf[prompt_len++] = c;
-        vga_putchar(c);
-    }
-    prompt_buf[prompt_len] = '\0';
-}
-
-/*
- * Send prompt to host proxy via serial.
- * Protocol: "Q:<text>\n"
- */
-static void send_query(void) {
-    serial_puts("Q:");
-    for (size_t i = 0; i < prompt_len; i++)
-        serial_write(prompt_buf[i]);
-    serial_write('\n');
-}
-
-/*
- * Receive response from host proxy via serial.
- * Protocol: "A:<text>\x04" (EOT terminated)
- * Displays each character on VGA as it arrives (streaming feel).
- */
-static void receive_response(void) {
-    /* Skip the "A:" prefix */
-    char c1 = serial_read();
-    char c2 = serial_read();
-    (void)c1; (void)c2;
-
-    /* Read and display response until EOT (0x04) */
-    while (1) {
-        char c = serial_read();
-        if (c == 0x04) break;  /* EOT = end of response */
-        vga_putchar(c);
-    }
-}
-
-/* ========== Number to string ========== */
-
-static void vga_putnum(uint32_t n) {
-    char buf[12];
-    int i = 0;
-    if (n == 0) { vga_putchar('0'); return; }
-    while (n > 0) { buf[i++] = '0' + (n % 10); n /= 10; }
-    while (--i >= 0) vga_putchar(buf[i]);
-}
-
-static void serial_putnum(uint32_t n) {
-    char buf[12];
-    int i = 0;
-    if (n == 0) { serial_write('0'); return; }
-    while (n > 0) { buf[i++] = '0' + (n % 10); n /= 10; }
-    while (--i >= 0) serial_write(buf[i]);
-}
-
-/*
- * Test: compute 3 + 5 = 8 using the page fault weird machine.
- * Uses the saturated addition algorithm from instless_comp:
- *
- *   r0 = input A (3)
- *   r1 = input B (5)
- *   r2 = temp
- *   r3 = result
- *
- *   L0: movdbz r2, 1024, L1, L1     ; r2 = 1024
- *   L1: movdbz r0, r0, L2, L3       ; while r0 > 0:
- *   L2: movdbz r2, r2, L1, L1       ;   r2-- (subtracting r0 from r2)
- *   L3: movdbz r1, r1, L4, L5       ; while r1 > 0:
- *   L4: movdbz r2, r2, L3, L3       ;   r2-- (subtracting r1 from r2)
- *   L5: movdbz r3, 1024, L7, L7     ; r3 = 1024
- *   L7: movdbz r2, r2, L8, exit     ; while r2 > 0:
- *   L8: movdbz r3, r3, L7, L7       ;   r3-- (subtracting r2 from r3)
- *                                    ; result: r3 = 1024 - (1024 - r0 - r1) = r0 + r1
- */
-static void test_weird_machine(void) {
-    vga_set_color(VGA_YELLOW, VGA_BLACK);
-    vga_puts("[TEST] Page fault weird machine: computing 3 + 5...\n");
-    serial_puts("TEST_WM_START\n");
-
-    /* Set up the weird machine */
-    wm_setup();
-
-    /* Allocate registers */
-    wm_write_reg(0, 3);      /* r0 = 3 (input A) */
-    wm_write_reg(1, 5);      /* r1 = 5 (input B) */
-    wm_write_reg(2, 0);      /* r2 = temp */
-    wm_write_reg(3, 0);      /* r3 = result */
-
-    /* Allocate constant 1024 */
-    int const_1024 = wm_alloc_const(1024);
-
-    /* Generate the addition program */
-    /* L0: movdbz r2, 1024, L1, L1  */
-    wm_gen_movdbz(0, 2, const_1024, 1, 1);
-    /* L1: movdbz r0, r0, L2, L3    */
-    wm_gen_movdbz(1, 0, 0, 2, 3);
-    /* L2: movdbz r2, r2, L1, L1    */
-    wm_gen_movdbz(2, 2, 2, 1, 1);
-    /* L3: movdbz r1, r1, L4, L5    */
-    wm_gen_movdbz(3, 1, 1, 4, 5);
-    /* L4: movdbz r2, r2, L3, L3    */
-    wm_gen_movdbz(4, 2, 2, 3, 3);
-    /* L5: movdbz r3, 1024, L7, L7  */
-    wm_gen_movdbz(5, 3, const_1024, 7, 7);
-    /* L7: movdbz r2, r2, L8, exit  */
-    wm_gen_movdbz(7, 2, 2, 8, -1);
-    /* L8: movdbz r3, r3, L7, L7    */
-    wm_gen_movdbz(8, 3, 3, 7, 7);
-
-    /* Run the program! (zero instructions during computation) */
-    vga_puts("[TEST] Launching fault cascade...\n");
-    wm_run();
-
-    /* Read the result */
-    uint32_t result = wm_read_reg(3);
-
-    vga_puts("[TEST] Result: r3 = ");
-    vga_putnum(result);
-    vga_puts(" (expected 8)\n");
-
-    serial_puts("TEST_WM_RESULT=");
-    serial_putnum(result);
-    serial_write('\n');
-
-    if (result == 8) {
-        vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
-        vga_puts("[TEST] PASS - Page fault computation works!\n\n");
-        serial_puts("TEST_WM_PASS\n");
-    } else {
-        vga_set_color(VGA_LIGHT_RED, VGA_BLACK);
-        vga_puts("[TEST] FAIL - Expected 8, got ");
-        vga_putnum(result);
-        vga_puts("\n\n");
-        serial_puts("TEST_WM_FAIL\n");
     }
 }
 
@@ -345,40 +386,30 @@ void kernel_main(void) {
 
     /* Banner */
     vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
-    vga_puts("=== PageFault Claude v0.1 ===\n");
+    vga_puts("=== PageFault Claude v0.2 ===\n");
     vga_set_color(VGA_DARK_GREY, VGA_BLACK);
     vga_puts("A Claude client computed via x86 page faults.\n");
     vga_puts("The MMU is the computer. Zero instructions executed.\n");
+    vga_puts("REPL state machine runs in movdbz via fault cascades.\n");
     vga_puts("--------------------------------------------\n\n");
 
-    /* Test the page fault weird machine */
-    test_weird_machine();
+    /* Set up the page fault weird machine */
+    vga_set_color(VGA_YELLOW, VGA_BLACK);
+    vga_puts("[init] Setting up page fault weird machine...\n");
+    wm_setup();
 
-    /* Signal proxy that we're ready */
-    serial_puts("READY\n");
+    /* Build the REPL program in movdbz */
+    vga_puts("[init] Building movdbz REPL program...\n");
+    build_repl_program();
 
-    /* REPL loop */
-    while (1) {
-        /* Prompt */
-        vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
-        vga_puts("> ");
+    vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
+    vga_puts("[init] Ready. I/O via serial. Type 'quit' to exit.\n\n");
 
-        /* Read user input */
-        vga_set_color(VGA_WHITE, VGA_BLACK);
-        read_prompt();
+    /* Run the I/O bridge loop (weird machine controls the REPL) */
+    io_bridge_loop();
 
-        /* Skip empty input */
-        if (prompt_len == 0) continue;
-
-        /* Send to proxy */
-        vga_set_color(VGA_DARK_GREY, VGA_BLACK);
-        vga_puts("[sending...]\n");
-        send_query();
-
-        /* Receive and display response */
-        vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
-        receive_response();
-        vga_putchar('\n');
-        vga_putchar('\n');
-    }
+    /* Halted */
+    vga_set_color(VGA_DARK_GREY, VGA_BLACK);
+    vga_puts("[halted]\n");
+    while (1) __asm__ volatile ("hlt");
 }

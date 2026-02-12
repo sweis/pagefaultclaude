@@ -511,3 +511,74 @@ void wm_run(void) {
     /* Restore normal page directory */
     write_cr3(X86_PD_ADDRESS);
 }
+
+void wm_generate(void) {
+    /* Initialize special registers */
+    gen_reg(REG_CONST_ONE_PAGE, 1);
+    gen_reg(REG_DISCARD_PAGE, 0);
+
+    /* Finalize first_inst_page */
+    first_inst_page = REG_R0_PAGE + num_user_regs + num_const_regs;
+
+    /* Initialize program GDT pages */
+    init_gdt(PAGE2VIRT(GDT_PAGE0));
+}
+
+/*
+ * Internal: launch the fault cascade starting at a given real instruction.
+ * entry_real_inst: the real (expanded) instruction number.
+ * src_reg_page: the register page to use as the source TSS for the first instruction.
+ */
+static void launch_at(int entry_real_inst, int src_reg_page) {
+    /* Re-initialize the GDT at the physical address (needed because
+     * TSS busy bits may be set from a previous run) */
+    init_gdt((uint32_t *)GDT_ADDRESS);
+
+    /* Re-initialize TSS for returning from weird machine */
+    init_tss();
+
+    /* Reload GDTR and TR (TR was left pointing at a weird machine TSS) */
+    set_gdtr(4 * 4096 - 1, GDT_ADDRESS);
+
+    /* Reload IDTR */
+    set_idtr(IDT_ADDRESS, 0x7ff);
+
+    /* Set up INIT_PD for the entry instruction */
+    generate_pagetable(INIT_PD);
+    map_src_tss(INIT_PD, entry_real_inst, src_reg_page);
+
+    /* Refresh program GDT pages (clear busy bits) */
+    init_gdt(PAGE2VIRT(GDT_PAGE0));
+
+    /* Switch to initial page directory */
+    write_cr3((PROG_BASE_PAGE + INIT_PD) << 12);
+
+    /* Launch! Build a far pointer for the indirect ljmp.
+     * The selector depends on which TSS slot this instruction uses. */
+    uint32_t sel = inst_to_tss_selector(entry_real_inst);
+    struct __attribute__((__packed__)) {
+        uint32_t offset;
+        uint16_t selector;
+    } far_ptr;
+    far_ptr.offset = 0;
+    far_ptr.selector = (uint16_t)sel;
+
+    __asm__ volatile (
+        "ljmp *%0\n\t"
+        "addl $4, %%esp"
+        : : "m"(far_ptr) : "memory"
+    );
+
+    /* Restore normal page directory */
+    write_cr3(X86_PD_ADDRESS);
+}
+
+void wm_launch(void) {
+    launch_at(0, REG_CONST_ONE_PAGE);
+}
+
+void wm_resume(int entry_asm_inst) {
+    /* Each asm instruction expands to 3 real instructions.
+     * We enter at the NOP0 of the target, which reads the source reg. */
+    launch_at(entry_asm_inst * 3, REG_CONST_ONE_PAGE);
+}
