@@ -518,8 +518,9 @@ void kernel_main(void) {
     /* Run the I/O bridge loop (weird machine controls the REPL) */
     io_bridge_loop();
 
-    /* Halted */
+    /* Shut down QEMU via isa-debug-exit device */
     vga_set_color(VGA_DARK_GREY, VGA_BLACK);
     vga_puts("[halted]\n");
+    outb(0x501, 0x00);
     while (1) __asm__ volatile ("hlt");
 }

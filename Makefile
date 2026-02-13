@@ -9,6 +9,7 @@ LD      = ld
 NASM    = nasm
 GRUB    = grub-mkrescue
 QEMU    = qemu-system-i386
+QEMUFLAGS = -device isa-debug-exit,iobase=0x501,iosize=0x04 -no-reboot
 
 # Flags - build for 32-bit bare metal
 CFLAGS  = -m32 -ffreestanding -fno-builtin -fno-stack-protector -nostdlib \
@@ -62,19 +63,19 @@ build:
 
 # Run in QEMU (VGA display)
 run: $(KERNEL)
-	$(QEMU) -kernel $< -display curses -no-reboot -no-shutdown
+	$(QEMU) $(QEMUFLAGS) -kernel $< -display curses
 
 # Run with serial on stdio
 run-serial: $(KERNEL)
-	$(QEMU) -kernel $< -display curses -serial stdio -no-reboot -no-shutdown
+	$(QEMU) $(QEMUFLAGS) -kernel $< -display curses -serial stdio
 
 # Run headless (serial on stdio, no display)
 run-headless: $(KERNEL)
-	$(QEMU) -kernel $< -nographic -no-reboot -no-shutdown
+	$(QEMU) $(QEMUFLAGS) -kernel $< -nographic
 
 # Run headless with extra RAM for page fault weird machine
 run-wm: $(KERNEL)
-	$(QEMU) -kernel $< -nographic -m 2048 -no-reboot -no-shutdown
+	$(QEMU) $(QEMUFLAGS) -kernel $< -nographic -m 2048
 
 # Run with the host proxy (type in the QEMU window)
 # Proxy logs go to proxy.log to avoid corrupting the curses display.
@@ -83,9 +84,8 @@ run-proxy: $(KERNEL)
 	python3 proxy/claude_proxy.py --port 4321 >proxy.log 2>&1 &
 	@sleep 1
 	@echo "Starting QEMU — type directly in this window..."
-	$(QEMU) -kernel $< -display curses -m 2048 \
-		-serial tcp:127.0.0.1:4321,server=on,wait=on \
-		-no-reboot -no-shutdown
+	$(QEMU) $(QEMUFLAGS) -kernel $< -display curses -m 2048 \
+		-serial tcp:127.0.0.1:4321,server=on,wait=on
 
 # Install build dependencies (Ubuntu/Debian)
 deps:
