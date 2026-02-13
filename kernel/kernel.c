@@ -5,13 +5,17 @@
  * fault cascades (zero instructions). Network I/O is handled by a minimal
  * x86 bridge stub communicating over serial to a host-side proxy.
  *
- * This file contains the VGA and serial I/O primitives, plus the initial
- * kernel entry point.
+ * This file contains the VGA, serial, and PS/2 keyboard I/O primitives,
+ * plus the initial kernel entry point.
+ *
+ * User input comes from the PS/2 keyboard (typed in the QEMU window)
+ * with serial as a fallback for automated tests.
  *
  * Wire protocol over serial:
  *   Kernel -> Proxy: "READY\n"           (kernel booted)
  *   Kernel -> Proxy: "Q:<prompt text>\n"  (query for Claude)
  *   Proxy -> Kernel: "A:<response text>\x04"  (answer, terminated by EOT)
+ *   Kernel -> Proxy: "Claude: <text>\n"  (response echoed for logging)
  */
 
 #include <stdint.h>
@@ -143,7 +147,80 @@ static void serial_puts(const char *s) {
     while (*s) serial_write(*s++);
 }
 
-/* (Keyboard driver removed - I/O is via serial) */
+/* ========== PS/2 Keyboard (Scan Code Set 1) ========== */
+
+#define KBD_DATA_PORT   0x60
+#define KBD_STATUS_PORT 0x64
+
+static int kbd_shift;
+
+/* Scan code set 1 → ASCII (unshifted), indices 0x00–0x39 */
+static const char sc_unshifted[58] = {
+       0,    0,  '1', '2', '3', '4', '5', '6',  /* 0x00-0x07 */
+     '7', '8', '9', '0', '-', '=', '\b', '\t',  /* 0x08-0x0F */
+     'q', 'w', 'e', 'r', 't', 'y', 'u', 'i',   /* 0x10-0x17 */
+     'o', 'p', '[', ']', '\n',  0,  'a', 's',   /* 0x18-0x1F */
+     'd', 'f', 'g', 'h', 'j', 'k', 'l', ';',   /* 0x20-0x27 */
+    '\'', '`',   0, '\\', 'z', 'x', 'c', 'v',  /* 0x28-0x2F */
+     'b', 'n', 'm', ',', '.', '/',   0,  '*',   /* 0x30-0x37 */
+       0, ' ',                                    /* 0x38-0x39 */
+};
+
+/* Scan code set 1 → ASCII (shifted) */
+static const char sc_shifted[58] = {
+       0,    0,  '!', '@', '#', '$', '%', '^',   /* 0x00-0x07 */
+     '&', '*', '(', ')', '_', '+', '\b', '\t',   /* 0x08-0x0F */
+     'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I',   /* 0x10-0x17 */
+     'O', 'P', '{', '}', '\n',  0,  'A', 'S',   /* 0x18-0x1F */
+     'D', 'F', 'G', 'H', 'J', 'K', 'L', ':',   /* 0x20-0x27 */
+     '"', '~',   0,  '|', 'Z', 'X', 'C', 'V',  /* 0x28-0x2F */
+     'B', 'N', 'M', '<', '>', '?',   0,  '*',   /* 0x30-0x37 */
+       0, ' ',                                    /* 0x38-0x39 */
+};
+
+static void kbd_init(void) {
+    /* Flush any pending data from the PS/2 controller */
+    while (inb(KBD_STATUS_PORT) & 0x01)
+        inb(KBD_DATA_PORT);
+    kbd_shift = 0;
+}
+
+static int kbd_has_key(void) {
+    return inb(KBD_STATUS_PORT) & 0x01;
+}
+
+/*
+ * Poll both PS/2 keyboard and serial; return the first available ASCII char.
+ * Keyboard input lets the user type in the QEMU window.
+ * Serial fallback keeps automated tests (run_test.py) working.
+ */
+static char input_read(void) {
+    while (1) {
+        /* Check PS/2 keyboard */
+        if (kbd_has_key()) {
+            uint8_t sc = inb(KBD_DATA_PORT);
+
+            /* Track shift key state */
+            if (sc == 0x2A || sc == 0x36) { kbd_shift = 1; continue; }
+            if (sc == 0xAA || sc == 0xB6) { kbd_shift = 0; continue; }
+
+            /* Ignore key-release (break) codes */
+            if (sc & 0x80) continue;
+
+            /* Ignore scancodes beyond our table */
+            if (sc >= 58) continue;
+
+            char c = kbd_shift ? sc_shifted[sc] : sc_unshifted[sc];
+            if (c) return c;
+            continue;  /* non-printable key, keep polling */
+        }
+
+        /* Check serial (fallback for automated tests) */
+        if (serial_received()) {
+            return inb(COM1);
+        }
+    }
+}
 
 /* ========== I/O Bridge Buffer ========== */
 
@@ -159,8 +236,6 @@ static int streq(const char *a, const char *b, size_t n) {
     }
     return 1;
 }
-
-/* (vga_putnum/serial_putnum removed - not needed for REPL) */
 
 /*
  * ========== Weird Machine REPL Program ==========
@@ -199,9 +274,9 @@ static int streq(const char *a, const char *b, size_t n) {
  *   L6:  movdbz r0, 1, L0, L0               ; jmp L0 (loop)
  *
  * The bridge handles:
- *   - READ_BYTE: read char from serial, store in r1, check for newline/quit
+ *   - READ_BYTE: read char from keyboard/serial, check for newline/quit
  *   - SEND_QUERY: send accumulated prompt_buf over serial as "Q:...\n"
- *   - RECV_RESPONSE: read serial until EOT, relay each byte back over serial
+ *   - RECV_RESPONSE: read serial until EOT, display on VGA + echo to serial
  *   - EXIT: halt
  *
  * Constants needed: CMD values (1, 3, 4), plus 1 for the loop-back.
@@ -298,8 +373,8 @@ static void io_bridge_loop(void) {
                 need_prompt = 0;
             }
 
-            /* Read one byte from serial */
-            char c = serial_read();
+            /* Read one byte from keyboard or serial (whichever has data) */
+            char c = input_read();
 
             if (c == '\n' || c == '\r') {
                 /* End of line */
@@ -382,16 +457,19 @@ static void io_bridge_loop(void) {
             char c2 = serial_read();
             (void)c1; (void)c2;
 
-            /* Relay response bytes to VGA only (proxy displays its own copy) */
+            /* Relay response bytes to VGA and serial (for proxy logging) */
             vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
             vga_puts("Claude: ");
+            serial_puts("Claude: ");
             while (1) {
                 char c = serial_read();
                 if (c == 0x04) break;
                 vga_putchar(c);
+                serial_write(c);
             }
             vga_putchar('\n');
             vga_putchar('\n');
+            serial_write('\n');
 
             /* Resume weird machine at loop-back instruction */
             wm_write_reg(R_CMD, 0);
@@ -414,6 +492,7 @@ static void io_bridge_loop(void) {
 void kernel_main(void) {
     vga_init();
     serial_init();
+    kbd_init();
 
     /* Banner */
     vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
@@ -434,7 +513,7 @@ void kernel_main(void) {
     build_repl_program();
 
     vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
-    vga_puts("[init] Ready. I/O via serial. Type 'quit' to exit.\n\n");
+    vga_puts("[init] Ready. Type in the QEMU window. 'quit' to exit.\n\n");
 
     /* Run the I/O bridge loop (weird machine controls the REPL) */
     io_bridge_loop();

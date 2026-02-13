@@ -76,15 +76,15 @@ run-headless: $(KERNEL)
 run-wm: $(KERNEL)
 	$(QEMU) -kernel $< -nographic -m 2048 -no-reboot -no-shutdown
 
-# Run with the host proxy
+# Run with the host proxy (type in the QEMU window)
 run-proxy: $(KERNEL)
-	@echo "Starting QEMU with serial on TCP port 4321..."
-	$(QEMU) -kernel $< -display curses -m 2048 \
-		-serial tcp:127.0.0.1:4321,server=on,wait=off \
-		-no-reboot -no-shutdown &
+	@echo "Starting Claude proxy in background..."
+	python3 proxy/claude_proxy.py --port 4321 &
 	@sleep 1
-	@echo "Starting Claude proxy..."
-	python3 proxy/claude_proxy.py --port 4321
+	@echo "Starting QEMU — type directly in this window..."
+	$(QEMU) -kernel $< -display curses -m 2048 \
+		-serial tcp:127.0.0.1:4321,server=on,wait=on \
+		-no-reboot -no-shutdown
 
 # Install build dependencies (Ubuntu/Debian)
 deps:

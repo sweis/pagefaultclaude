@@ -13,9 +13,9 @@ Three layers:
 
 1. **Page fault weird machine** (`kernel/weirdmachine.c`) — A Turing-complete one-instruction computer (`movdbz`: move-decrement-branch-if-zero) implemented purely via TSS task switches triggered by cascading page faults and double faults.
 
-2. **I/O bridge** (`kernel/kernel.c`) — Traps exits from the weird machine, services serial I/O requests, and resumes the fault cascade at the appropriate instruction.
+2. **I/O bridge** (`kernel/kernel.c`) — Traps exits from the weird machine, services I/O requests (PS/2 keyboard input, VGA display, serial communication), and resumes the fault cascade at the appropriate instruction.
 
-3. **Host proxy** (`proxy/claude_proxy.py`) — Runs on the host machine, bridges serial I/O to the Claude API over HTTPS. The API key stays here and never touches the weird machine.
+3. **Host proxy** (`proxy/claude_proxy.py`) — Pure API bridge running on the host. Listens for queries on the serial port, calls the Claude API, and sends responses back. The API key stays here and never touches the weird machine.
 
 ## How It Works
 
@@ -36,16 +36,11 @@ This is implemented without executing ANY instructions:
 
 Source registers are NOT consumed by movdbz execution (the save goes to the destination page via per-instruction page directory remapping), so constants persist across resume cycles.
 
-## Status
+## I/O Design
 
-**Working:**
-- Page fault weird machine core (movdbz via TSS fault cascades)
-- 7-instruction movdbz REPL state machine
-- I/O bridge with launch and resume
-- Multiple query-response cycles (resume works correctly)
-- Empty line handling, quit detection, backspace
-- Claude API proxy with user input forwarding
-- Full end-to-end test passes (run_test.py)
+The user types directly in the QEMU window via the PS/2 keyboard. The kernel's I/O bridge reads keystrokes, accumulates a line buffer, and displays input on the VGA screen. Serial is used only for the proxy wire protocol (`Q:`/`A:` messages) and logging.
+
+The `input_read()` function polls both PS/2 keyboard and serial, returning whichever has data first. This lets the user type interactively in the QEMU window while keeping automated tests (`run_test.py`) working via serial input.
 
 ## Build & Run
 

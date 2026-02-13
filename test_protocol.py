@@ -2,13 +2,16 @@
 """Test the serial wire protocol without needing the Claude API.
 Connects to QEMU's serial port on TCP and acts as a mock proxy.
 
+User input comes from the PS/2 keyboard (typed in the QEMU window).
+This script just handles Q: queries with mock responses.
+
 Usage:
   1. Start QEMU:
        make all && qemu-system-i386 -kernel build/pagefault_claude \
-         -serial tcp:127.0.0.1:4321,server=on,wait=off \
+         -serial tcp:127.0.0.1:4321,server=on,wait=on \
          -display curses -m 2048 -no-reboot -no-shutdown
   2. Run this script: python3 test_protocol.py
-  3. Type queries at the prompt; mock responses are sent back.
+  3. Type queries in the QEMU window; mock responses are sent back.
 """
 
 import socket
@@ -53,38 +56,27 @@ def main():
         line = readline(sock)
         print(f"[kernel] {line}")
         if line.strip() == "READY":
-            print("Kernel ready! Weird machine is running.\n")
+            print("Kernel ready! Type in the QEMU window.\n")
             break
 
-    # Main REPL loop
+    # Main loop: handle Q: queries and BYE
     try:
         while True:
-            user_input = input("test> ")
-            if not user_input:
-                sock.sendall(b"\n")
-                readline(sock)  # consume echo
-                continue
+            line = readline(sock)
+            print(f"[kernel] {line}")
 
-            # Send user input to kernel
-            sock.sendall(user_input.encode() + b"\n")
+            if line.startswith("Q:"):
+                query = line[2:]
+                print(f"[test] Got query: {query!r}")
 
-            # Read serial output until Q: or BYE
-            while True:
-                line = readline(sock)
+                # Send mock response
+                response = f"[Mock echo] You said: {query}"
+                sock.sendall(b"A:" + response.encode() + EOT)
+                print(f"[test] Sent response: {response}")
 
-                if line.startswith("Q:"):
-                    query = line[2:]
-                    print(f"[test] Got query: {query!r}")
-
-                    # Send mock response
-                    response = f"[Mock echo] You said: {query}"
-                    sock.sendall(b"A:" + response.encode() + EOT)
-                    print(f"\n{response}\n")
-                    break
-
-                elif line.strip() == "BYE":
-                    print("Kernel says goodbye.")
-                    return
+            elif line.strip() == "BYE":
+                print("Kernel says goodbye.")
+                return
 
     except (KeyboardInterrupt, ConnectionError, EOFError):
         print("\nTest ended.")

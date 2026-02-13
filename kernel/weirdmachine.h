@@ -84,7 +84,7 @@ void wm_resume(int entry_asm_inst);
 
 /* I/O bridge command codes (written to r_cmd by the movdbz program) */
 #define WM_IO_EXIT           0   /* Program done */
-#define WM_IO_READ_BYTE      1   /* Read a byte from serial into r_data */
+#define WM_IO_READ_BYTE      1   /* Read a byte from keyboard/serial */
 #define WM_IO_WRITE_BYTE     2   /* Write r_data byte to serial */
 #define WM_IO_SEND_QUERY     3   /* Send accumulated buffer as query */
 #define WM_IO_RECV_RESPONSE  4   /* Receive response, relay bytes via serial */

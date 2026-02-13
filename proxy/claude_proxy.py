@@ -2,15 +2,14 @@
 """
 PageFault Claude - Host-side proxy
 
-Bridges the bare-metal kernel's serial port to the Claude API.
-The API key is handled entirely here (via ANTHROPIC_API_KEY env var)
-and never passes through the weird machine or the kernel.
+Pure API bridge: reads Q: queries from serial, calls Claude, sends A: responses.
+User input comes from the PS/2 keyboard (typed in the QEMU window), NOT from
+the proxy terminal. All serial traffic is logged to the screen.
 
 Wire protocol:
   Kernel -> Proxy: "READY\n"            (kernel booted)
-  Kernel -> Proxy: echo chars + "\n"    (echo of user typing)
+  Kernel -> Proxy: <echo chars + "\n">  (echo of keyboard input)
   Kernel -> Proxy: "Q:<prompt text>\n"  (query for Claude)
-  Proxy -> Kernel: user input chars     (forwarded from stdin)
   Proxy -> Kernel: "A:<response text>\\x04"  (answer, EOT terminated)
   Kernel -> Proxy: "BYE\n"             (user typed quit)
 
@@ -31,10 +30,10 @@ EOT = b"\x04"
 
 BANNER = """
 ╔═══════════════════════════════════════════════════════╗
-║  PageFault Claude - Weird Machine REPL               ║
+║  PageFault Claude - Weird Machine Proxy               ║
 ║  Computation via x86 page fault cascades.             ║
 ║  Zero instructions executed. The MMU is the computer. ║
-║  Type 'quit' to exit.                                 ║
+║  Type in the QEMU window, not here.                   ║
 ╚═══════════════════════════════════════════════════════╝
 """
 
@@ -145,54 +144,34 @@ def main():
         # Wait for kernel READY signal
         while True:
             line = serial.readline()
+            print(f"[serial] {line}", file=sys.stderr)
             if line.strip() == "READY":
-                print("Kernel ready! Page fault weird machine is running.\n",
-                      file=sys.stderr)
+                print("Kernel ready! Type in the QEMU window.\n", file=sys.stderr)
                 break
 
-        # Main REPL loop
+        # Main loop: listen for Q: queries and BYE
         while True:
-            # Prompt and read user input
-            try:
-                user_input = input("pagefault> ")
-            except EOFError:
-                break
+            line = serial.readline()
+            print(f"[serial] {line}", file=sys.stderr)
 
-            if not user_input:
-                # Send just newline (kernel handles empty lines)
-                serial.write(b"\n")
-                # Consume the echo
-                serial.readline()
-                continue
+            if line.startswith("Q:"):
+                query = line[2:]
+                print(f"[query] {query}", file=sys.stderr)
 
-            # Send user input to kernel serial port (character by character
-            # is fine; the kernel reads byte-by-byte from the UART FIFO)
-            serial.write(user_input.encode("utf-8") + b"\n")
+                if client is not None:
+                    response = query_claude(client, query)
+                else:
+                    response = f"[Mock] You said: {query}"
 
-            # Read serial output until we get the Q: line or BYE
-            while True:
-                line = serial.readline()
+                # Send response to kernel
+                serial.write(b"A:" + response.encode("utf-8") + EOT)
+                print(f"[response sent]", file=sys.stderr)
 
-                if line.startswith("Q:"):
-                    query = line[2:]
+            elif line.strip() == "BYE":
+                print("Session ended. The weird machine has halted.", file=sys.stderr)
+                return
 
-                    if client is not None:
-                        response = query_claude(client, query)
-                    else:
-                        response = f"[Mock] You said: {query}"
-
-                    # Send response to kernel
-                    serial.write(b"A:" + response.encode("utf-8") + EOT)
-
-                    # Display response locally
-                    print(f"\n{response}\n")
-                    break
-
-                elif line.strip() == "BYE":
-                    print("Session ended. The weird machine has halted.")
-                    return
-
-                # Otherwise it's an echo line or status message; ignore
+            # Otherwise it's echo/status output — already logged above
 
     except (KeyboardInterrupt, ConnectionError) as e:
         print(f"\nProxy shutting down. ({e})", file=sys.stderr)
