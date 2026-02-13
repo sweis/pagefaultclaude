@@ -232,11 +232,13 @@ static void build_repl_program(void) {
     wm_write_reg(R_DATA, 0);
     wm_write_reg(R_TEMP, 0);
 
-    /* Allocate constants */
-    int c_read  = wm_alloc_const(WM_IO_READ_BYTE);    /* 1 */
-    int c_sendq = wm_alloc_const(WM_IO_SEND_QUERY);   /* 3 */
-    int c_recvr = wm_alloc_const(WM_IO_RECV_RESPONSE); /* 4 */
-    int c_one   = wm_alloc_const(1);                    /* for loop-back */
+    /* Allocate constants.
+     * movdbz computes: dst = src - 1.  So to get the desired command
+     * code N in R_CMD, the constant must be initialised to N + 1. */
+    int c_read  = wm_alloc_const(WM_IO_READ_BYTE + 1);      /* 2 → cmd 1 */
+    int c_sendq = wm_alloc_const(WM_IO_SEND_QUERY + 1);     /* 4 → cmd 3 */
+    int c_recvr = wm_alloc_const(WM_IO_RECV_RESPONSE + 1);  /* 5 → cmd 4 */
+    int c_one   = wm_alloc_const(1);                          /* loop-back */
 
     /* L0: movdbz r0, c_read, L1, L1   -- r0 = READ_BYTE */
     wm_gen_movdbz(L_READ_CMD,  R_CMD, c_read, L_READ_EXIT, L_READ_EXIT);
@@ -273,6 +275,7 @@ static void build_repl_program(void) {
  */
 static void io_bridge_loop(void) {
     prompt_len = 0;
+    int need_prompt = 1;
 
     serial_puts("READY\n");
 
@@ -288,12 +291,20 @@ static void io_bridge_loop(void) {
 
         switch (cmd) {
         case WM_IO_READ_BYTE: {
+            /* Show prompt on VGA at the start of a new input line */
+            if (need_prompt) {
+                vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
+                vga_puts("pagefault> ");
+                need_prompt = 0;
+            }
+
             /* Read one byte from serial */
             char c = serial_read();
 
             if (c == '\n' || c == '\r') {
-                /* End of line - resume at L_SEND_CMD (send query) */
+                /* End of line */
                 serial_write('\n');  /* Echo newline */
+                vga_putchar('\n');
 
                 /* Check for "quit" */
                 if (prompt_len == 4 && streq(prompt_buf, "quit", 4)) {
@@ -303,15 +314,37 @@ static void io_bridge_loop(void) {
                     return;
                 }
 
+                /* Empty line: skip query, read again */
+                if (prompt_len == 0) {
+                    need_prompt = 1;
+                    wm_write_reg(R_CMD, 0);
+                    wm_resume(L_READ_CMD);
+                    break;
+                }
+
                 /* Resume weird machine at send-query phase */
+                need_prompt = 1;
                 wm_write_reg(R_CMD, 0);
                 wm_resume(L_SEND_CMD);
+            } else if (c == '\b' || c == 0x7f) {
+                /* Backspace */
+                if (prompt_len > 0) {
+                    prompt_len--;
+                    serial_write('\b');
+                    serial_write(' ');
+                    serial_write('\b');
+                    vga_putchar('\b');
+                }
+                wm_write_reg(R_CMD, 0);
+                wm_resume(L_READ_CMD);
             } else {
                 /* Accumulate byte in buffer, echo it */
                 if (prompt_len < PROMPT_BUF_SIZE - 1) {
                     prompt_buf[prompt_len++] = c;
                 }
-                serial_write(c);  /* Echo */
+                serial_write(c);    /* Echo to serial */
+                vga_set_color(VGA_WHITE, VGA_BLACK);
+                vga_putchar(c);     /* Echo to VGA */
 
                 /* Resume weird machine at read-cmd (read next byte) */
                 wm_write_reg(R_CMD, 0);
@@ -325,9 +358,7 @@ static void io_bridge_loop(void) {
             prompt_buf[prompt_len] = '\0';
 
             vga_set_color(VGA_DARK_GREY, VGA_BLACK);
-            vga_puts("[query: ");
-            vga_puts(prompt_buf);
-            vga_puts("]\n");
+            vga_puts("[sending query via fault cascade]\n");
 
             /* Wire protocol: Q:<text>\n */
             serial_puts("Q:");
@@ -351,15 +382,15 @@ static void io_bridge_loop(void) {
             char c2 = serial_read();
             (void)c1; (void)c2;
 
-            /* Relay response bytes to serial output (and VGA) until EOT */
+            /* Relay response bytes to VGA only (proxy displays its own copy) */
             vga_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
+            vga_puts("Claude: ");
             while (1) {
                 char c = serial_read();
                 if (c == 0x04) break;
-                serial_write(c);  /* Relay to user's terminal */
                 vga_putchar(c);
             }
-            serial_write('\n');
+            vga_putchar('\n');
             vga_putchar('\n');
 
             /* Resume weird machine at loop-back instruction */

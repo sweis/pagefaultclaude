@@ -8,8 +8,11 @@ and never passes through the weird machine or the kernel.
 
 Wire protocol:
   Kernel -> Proxy: "READY\n"            (kernel booted)
-  Kernel -> Proxy: "Q:<prompt text>\n"   (query for Claude)
+  Kernel -> Proxy: echo chars + "\n"    (echo of user typing)
+  Kernel -> Proxy: "Q:<prompt text>\n"  (query for Claude)
+  Proxy -> Kernel: user input chars     (forwarded from stdin)
   Proxy -> Kernel: "A:<response text>\\x04"  (answer, EOT terminated)
+  Kernel -> Proxy: "BYE\n"             (user typed quit)
 
 Usage:
   # With QEMU serial on TCP:
@@ -20,12 +23,20 @@ Usage:
 """
 
 import argparse
-import os
 import socket
 import sys
 import time
 
 EOT = b"\x04"
+
+BANNER = """
+╔═══════════════════════════════════════════════════════╗
+║  PageFault Claude - Weird Machine REPL               ║
+║  Computation via x86 page fault cascades.             ║
+║  Zero instructions executed. The MMU is the computer. ║
+║  Type 'quit' to exit.                                 ║
+╚═══════════════════════════════════════════════════════╝
+"""
 
 
 def create_anthropic_client():
@@ -49,6 +60,8 @@ def query_claude(client, prompt):
         response = client.messages.create(
             model="claude-sonnet-4-5-20250929",
             max_tokens=512,
+            system="You are responding via a bizarre x86 page fault weird machine. "
+                   "Keep responses concise (1-3 paragraphs). Be helpful and fun.",
             messages=[{"role": "user", "content": prompt}],
         )
         return response.content[0].text
@@ -63,14 +76,14 @@ class SerialConnection:
         self.mode = mode
         if mode == "tcp":
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            print(f"Connecting to QEMU serial at {host}:{port}...")
-            for attempt in range(10):
+            print(f"Connecting to QEMU serial at {host}:{port}...", file=sys.stderr)
+            for attempt in range(30):
                 try:
                     self.sock.connect((host, port))
-                    print("Connected.")
+                    print("Connected.", file=sys.stderr)
                     return
                 except ConnectionRefusedError:
-                    if attempt < 9:
+                    if attempt < 29:
                         time.sleep(1)
             print("ERROR: Could not connect to QEMU serial port.", file=sys.stderr)
             sys.exit(1)
@@ -113,39 +126,76 @@ def main():
                         help="Host for QEMU serial (default: 127.0.0.1)")
     parser.add_argument("--pipe", action="store_true",
                         help="Use stdin/stdout instead of TCP")
+    parser.add_argument("--no-api", action="store_true",
+                        help="Mock mode: echo queries instead of calling Claude")
     args = parser.parse_args()
 
-    client = create_anthropic_client()
+    if args.no_api:
+        client = None
+    else:
+        client = create_anthropic_client()
+
     mode = "pipe" if args.pipe else "tcp"
     serial = SerialConnection(mode, args.host, args.port)
 
-    print("PageFault Claude proxy started. Waiting for kernel...", file=sys.stderr)
+    print(BANNER, file=sys.stderr)
+    print("Waiting for kernel boot...", file=sys.stderr)
 
     try:
         # Wait for kernel READY signal
         while True:
             line = serial.readline()
-            print(f"[kernel] {line}", file=sys.stderr)
             if line.strip() == "READY":
-                print("Kernel ready. Waiting for queries...", file=sys.stderr)
+                print("Kernel ready! Page fault weird machine is running.\n",
+                      file=sys.stderr)
                 break
 
-        # Main loop: handle queries
+        # Main REPL loop
         while True:
-            line = serial.readline()
-            print(f"[kernel] {line}", file=sys.stderr)
+            # Prompt and read user input
+            try:
+                user_input = input("pagefault> ")
+            except EOFError:
+                break
 
-            if line.startswith("Q:"):
-                prompt = line[2:]
-                print(f"[proxy] Query: {prompt!r}", file=sys.stderr)
+            if not user_input:
+                # Send just newline (kernel handles empty lines)
+                serial.write(b"\n")
+                # Consume the echo
+                serial.readline()
+                continue
 
-                response = query_claude(client, prompt)
-                print(f"[proxy] Response: {response[:80]}...", file=sys.stderr)
+            # Send user input to kernel serial port (character by character
+            # is fine; the kernel reads byte-by-byte from the UART FIFO)
+            serial.write(user_input.encode("utf-8") + b"\n")
 
-                serial.write(b"A:" + response.encode("utf-8") + EOT)
+            # Read serial output until we get the Q: line or BYE
+            while True:
+                line = serial.readline()
 
-    except (KeyboardInterrupt, ConnectionError):
-        print("\nProxy shutting down.", file=sys.stderr)
+                if line.startswith("Q:"):
+                    query = line[2:]
+
+                    if client is not None:
+                        response = query_claude(client, query)
+                    else:
+                        response = f"[Mock] You said: {query}"
+
+                    # Send response to kernel
+                    serial.write(b"A:" + response.encode("utf-8") + EOT)
+
+                    # Display response locally
+                    print(f"\n{response}\n")
+                    break
+
+                elif line.strip() == "BYE":
+                    print("Session ended. The weird machine has halted.")
+                    return
+
+                # Otherwise it's an echo line or status message; ignore
+
+    except (KeyboardInterrupt, ConnectionError) as e:
+        print(f"\nProxy shutting down. ({e})", file=sys.stderr)
     finally:
         serial.close()
 
