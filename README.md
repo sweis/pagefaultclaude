@@ -122,6 +122,20 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 make run-proxy
 ```
 
+Proxy logs go to `proxy.log`. To watch them: `tail -f proxy.log` in another terminal.
+
+For a two-terminal setup (proxy logs visible on screen):
+
+```bash
+# Terminal 1: QEMU (type here)
+qemu-system-i386 -kernel build/pagefault_claude \
+  -serial tcp:127.0.0.1:4321,server=on,wait=on \
+  -display curses -m 2048 -no-reboot -no-shutdown
+
+# Terminal 2: proxy (logs to screen)
+python3 proxy/claude_proxy.py --port 4321
+```
+
 The `--no-api` flag on `claude_proxy.py` enables mock mode without an API key.
 
 ## Files

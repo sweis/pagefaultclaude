@@ -77,9 +77,10 @@ run-wm: $(KERNEL)
 	$(QEMU) -kernel $< -nographic -m 2048 -no-reboot -no-shutdown
 
 # Run with the host proxy (type in the QEMU window)
+# Proxy logs go to proxy.log to avoid corrupting the curses display.
 run-proxy: $(KERNEL)
-	@echo "Starting Claude proxy in background..."
-	python3 proxy/claude_proxy.py --port 4321 &
+	@echo "Starting Claude proxy in background (logging to proxy.log)..."
+	python3 proxy/claude_proxy.py --port 4321 >proxy.log 2>&1 &
 	@sleep 1
 	@echo "Starting QEMU — type directly in this window..."
 	$(QEMU) -kernel $< -display curses -m 2048 \

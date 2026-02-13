@@ -1,6 +1,7 @@
 build/
 *.o
 *.iso
+proxy.log
 
 # Reference code from kristerw/instless_comp (not part of this project)
 setup.c
