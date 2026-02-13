@@ -4,6 +4,8 @@ A Claude API client where the core REPL logic runs entirely via **x86 page fault
 
 You type directly in the QEMU window. Your keystrokes go through a page fault weird machine, and Claude's responses appear on the VGA display.
 
+<img width="641" height="479" alt="image" src="https://github.com/user-attachments/assets/c69443e2-8388-47e1-ac58-50508eb12e14" />
+
 ## Build & Run
 
 ```bash
